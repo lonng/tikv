@@ -45,7 +45,7 @@ use kvproto::debugpb::{DB as DBType, *};
 use kvproto::debugpb_grpc::DebugClient;
 use kvproto::kvrpcpb::{MvccInfo, SplitRegionRequest};
 use kvproto::metapb::{Peer, Region};
-use kvproto::raft_cmdpb::RaftCmdRequest;
+use kvproto::raft_cmdpb::{AdminCmdType, RaftCmdRequest};
 use kvproto::raft_serverpb::{PeerState, SnapshotMeta};
 use kvproto::tikvpb_grpc::TikvClient;
 use raft::eraftpb::{ConfChange, Entry, EntryType};
@@ -166,6 +166,14 @@ trait DebugExecutor {
         v1!("raft state: {:?}", r.raft_local_state);
         v1!("apply state key: {}", escape(&apply_state_key));
         v1!("apply state: {:?}", r.raft_apply_state);
+        if let Some(apply_state) = r.raft_apply_state {
+            if apply_state.get_applied_index() + 1 <= apply_state.get_truncated_state().get_index()
+                || apply_state.get_applied_index() + 1
+                    < apply_state.get_truncated_state().get_index() + 1
+            {
+                v1!("find bad region! {}", region);
+            }
+        }
     }
 
     fn dump_all_region_info(&self, skip_tombstone: bool) {
@@ -194,6 +202,19 @@ trait DebugExecutor {
                 let mut msg = RaftCmdRequest::new();
                 msg.merge_from_bytes(&data).unwrap();
                 v1!("Normal: {:#?}", msg);
+                if msg.has_admin_request() {
+                    let admin = msg.get_admin_request();
+                    if let AdminCmdType::CommitMerge = admin.get_cmd_type() {
+                        let merge = admin.get_commit_merge();
+                        let entries = merge.get_entries();
+                        for e in entries {
+                            let data = e.get_data();
+                            let mut msg = RaftCmdRequest::new();
+                            msg.merge_from_bytes(data).unwrap();
+                            v1!("Entry in Merge: index {} \n{:#?}", e.get_index(), msg);
+                        }
+                    }
+                }
             }
             EntryType::EntryConfChange => {
                 let mut msg = ConfChange::new();

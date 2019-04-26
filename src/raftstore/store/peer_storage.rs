@@ -482,6 +482,7 @@ impl PeerStorage {
                 low, high
             )));
         } else if low <= self.truncated_index() {
+            error!("raft log compacted"; "low" => low, "high" => high, "region_id" => self.get_region_id());
             return Err(RaftError::Store(StorageError::Compacted));
         } else if high > self.last_index() + 1 {
             return Err(storage_error(format!(

@@ -1080,16 +1080,14 @@ impl ApplyDelegate {
     ) -> Result<(RaftCmdResponse, ApplyResult)> {
         let request = req.get_admin_request();
         let cmd_type = request.get_cmd_type();
-        if cmd_type != AdminCmdType::CompactLog && cmd_type != AdminCmdType::CommitMerge {
-            info!(
-                "execute admin command";
-                "region_id" => self.region_id(),
-                "peer_id" => self.id(),
-                "term" => ctx.exec_ctx.as_ref().unwrap().term,
-                "index" => ctx.exec_ctx.as_ref().unwrap().index,
-                "command" => ?request
-            );
-        }
+        info!(
+            "execute admin command";
+            "region_id" => self.region_id(),
+            "peer_id" => self.id(),
+            "term" => ctx.exec_ctx.as_ref().unwrap().term,
+            "index" => ctx.exec_ctx.as_ref().unwrap().index,
+            "command" => ?request
+        );
 
         let (mut response, exec_result) = match cmd_type {
             AdminCmdType::ChangePeer => self.exec_change_peer(ctx, request),

@@ -77,7 +77,7 @@ run:
 	cargo run --no-default-features --features  "${ENABLE_FEATURES}" --bin tikv-server
 
 release:
-	cargo build --no-default-features --release --features "${ENABLE_FEATURES}"
+	cargo build --no-default-features --release --features "${ENABLE_FEATURES}" --bin tikv-server
 	@mkdir -p ${BIN_PATH}
 	@cp -f ${CARGO_TARGET_DIR}/release/tikv-ctl ${CARGO_TARGET_DIR}/release/tikv-server ${CARGO_TARGET_DIR}/release/tikv-importer ${BIN_PATH}/
 	bash scripts/check-sse4_2.sh

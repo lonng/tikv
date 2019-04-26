@@ -720,9 +720,32 @@ impl Debugger {
         }
     }
 
+    fn get_raft_state(&self, region_id: u64) -> Result<RaftLocalState> {
+        let raft_state_key = keys::raft_state_key(region_id);
+        let raft_state = box_try!(self.engines.raft.get_msg::<RaftLocalState>(&raft_state_key));
+        match raft_state {
+            Some(v) => Ok(v),
+            None => Err(Error::NotFound(format!("region {}", region_id))),
+        }
+    }
+
+    fn get_apply_state(&self, region_id: u64) -> Result<RaftApplyState> {
+        let apply_state_key = keys::apply_state_key(region_id);
+        let apply_state = box_try!(self
+            .engines
+            .raft
+            .get_msg::<RaftApplyState>(&apply_state_key));
+        match apply_state {
+            Some(v) => Ok(v),
+            None => Err(Error::NotFound(format!("region {}", region_id))),
+        }
+    }
+
     pub fn get_region_properties(&self, region_id: u64) -> Result<Vec<(String, String)>> {
         let region_state = self.get_region_state(region_id)?;
         let region = region_state.get_region();
+        let raft_state = self.get_raft_state(region_id)?;
+        let apply_state = self.get_apply_state(region_id)?;
         let kv_engine = &self.engines.kv;
 
         let mut num_entries = 0;
@@ -764,6 +787,9 @@ impl Debugger {
             "middle_key_by_approximate_size".to_string(),
             escape(&middle_key),
         ));
+        res.push(("region_state".to_owned(), format!("{:?}", region_state)));
+        res.push(("raft_state".to_owned(), format!("{:?}", raft_state)));
+        res.push(("apply_state".to_owned(), format!("{:?}", apply_state)));
         Ok(res)
     }
 }
