@@ -590,19 +590,65 @@ mod tests {
 
     #[test]
     fn test_convert_uint_into_int() {
-        assert!(convert_uint_to_int(u64::MAX, FieldTypeTp::LongLong).is_err());
-        let v = convert_uint_to_int(u64::MIN, FieldTypeTp::LongLong).unwrap();
-        assert_eq!(v, u64::MIN as i64);
-        // TODO port tests from tidb(tidb haven't implemented now)
+        let tests: Vec<(u64, FieldTypeTp, Option<i64>)> = vec![
+            (123, FieldTypeTp::Tiny, Some(123)),
+            (256, FieldTypeTp::Tiny, None),
+            (123, FieldTypeTp::Short, Some(123)),
+            (65536, FieldTypeTp::Short, None),
+            (123, FieldTypeTp::Int24, Some(123)),
+            (8388610, FieldTypeTp::Int24, None),
+            (8388610, FieldTypeTp::Long, Some(8388610)),
+            (4294967297, FieldTypeTp::Long, None),
+            (4294967297, FieldTypeTp::LongLong, Some(4294967297)),
+            (u64::MAX, FieldTypeTp::LongLong, None),
+        ];
+
+        for (from, tp, to) in tests {
+            let r = convert_uint_to_int(from, tp);
+            match to {
+                Some(to) => assert_eq!(to, r.unwrap()),
+                None => assert!(
+                    r.is_err(),
+                    "from: {}, to tp: {} should be overflow",
+                    from,
+                    tp
+                ),
+            }
+        }
     }
 
     #[test]
     fn test_convert_float_to_int() {
-        assert!(convert_float_to_int(f64::MIN, FieldTypeTp::LongLong).is_err());
-        assert!(convert_float_to_int(f64::MAX, FieldTypeTp::LongLong).is_err());
-        let v = convert_float_to_int(0.1, FieldTypeTp::LongLong).unwrap();
-        assert_eq!(v, 0);
-        // TODO port tests from tidb(tidb haven't implemented now)
+        let tests: Vec<(f64, FieldTypeTp, Option<i64>)> = vec![
+            (123.1, FieldTypeTp::Tiny, Some(123)),
+            (123.6, FieldTypeTp::Tiny, Some(124)),
+            (256.5, FieldTypeTp::Tiny, None),
+            (256.1, FieldTypeTp::Short, Some(256)),
+            (256.6, FieldTypeTp::Short, Some(257)),
+            (65535.5, FieldTypeTp::Short, None),
+            (65536.1, FieldTypeTp::Int24, Some(65536)),
+            (65536.5, FieldTypeTp::Int24, Some(65537)),
+            (8388610.2, FieldTypeTp::Int24, None),
+            (8388610.4, FieldTypeTp::Long, Some(8388610)),
+            (8388610.5, FieldTypeTp::Long, Some(8388611)),
+            (4294967296.8, FieldTypeTp::Long, None),
+            (4294967296.8, FieldTypeTp::LongLong, Some(4294967297)),
+            (4294967297.1, FieldTypeTp::LongLong, Some(4294967297)),
+            (f64::MAX, FieldTypeTp::LongLong, None),
+        ];
+
+        for (from, tp, to) in tests {
+            let r = convert_float_to_int(from, tp);
+            match to {
+                Some(to) => assert_eq!(to, r.unwrap()),
+                None => assert!(
+                    r.is_err(),
+                    "from: {}, to tp: {} should be overflow",
+                    from,
+                    tp
+                ),
+            }
+        }
     }
 
     #[test]
