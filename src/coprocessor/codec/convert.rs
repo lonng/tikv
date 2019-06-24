@@ -412,14 +412,18 @@ mod tests {
             (-4294967297, FieldTypeTp::Long, None),
             (8388610, FieldTypeTp::LongLong, Some(8388610)),
             (-8388610, FieldTypeTp::LongLong, Some(-8388610)),
-            (u64::MAX as i64, FieldTypeTp::LongLong, None),
         ];
 
         for (from, tp, to) in tests {
             let r = convert_int_to_int(from, tp);
             match to {
                 Some(to) => assert_eq!(to, r.unwrap()),
-                None => assert!(r.is_err()),
+                None => assert!(
+                    r.is_err(),
+                    "from: {}, to tp: {} should be overflow",
+                    from,
+                    tp
+                ),
             }
         }
     }
