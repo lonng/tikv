@@ -1,8 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
-use std::convert::AsRef;
-use std::{self, char, i16, i32, i64, i8, str, u16, u32, u64, u8};
+use std::{self, char, f64, i16, i32, i64, i8, str, u16, u32, u64, u8};
 
 use chrono::Timelike;
 use cop_datatype::{self, FieldTypeTp};
@@ -528,36 +527,52 @@ pub fn bytes_to_uint_without_context(bytes: &[u8]) -> Result<u64> {
     r.ok_or_else(|| Error::overflow("BIGINT UNSIGNED", ""))
 }
 
-fn bytes_to_f64_without_context(bytes: &[u8]) -> Result<f64> {
-    let f = match std::str::from_utf8(bytes) {
-        Ok(s) => match s.trim().parse::<f64>() {
-            Ok(f) => f,
-            Err(e) => {
-                error!(
-                    "failed to parse float";
-                    "from" => s,
-                    "err" => %e,
-                );
-                0.0
-            }
-        },
-        Err(e) => {
-            error!(
-                "failed to convert bytes to str";
-                "err" => %e
-            );
-            0.0
-        }
-    };
-    Ok(f)
-}
-
-/// `bytes_to_f64` converts a byte array to a float64 in best effort.
-pub fn bytes_to_f64(ctx: &mut EvalContext, bytes: &[u8]) -> Result<f64> {
+/// Converts a byte array to a float64 in best effort.
+#[inline]
+pub fn convert_bytes_to_f64(ctx: &mut EvalContext, bytes: &[u8]) -> Result<f64> {
     let s = str::from_utf8(bytes)?.trim();
     let vs = get_valid_float_prefix(ctx, s)?;
+    match vs.parse::<f64>() {
+        Ok(val) => {
+            if val.is_infinite() {
+                ctx.handle_overflow(Error::overflow("DOUBLE", &vs))?;
+                if val.is_sign_negative() {
+                    return Ok(f64::MIN);
+                } else {
+                    return Ok(f64::MAX);
+                }
+            }
+            Ok(val)
+        }
+        Err(err) => Err(box_err!("parse float err: {}", err)),
+    }
+}
 
-    bytes_to_f64_without_context(vs.as_bytes())
+/// Converts a `DateTime` to float64 in best effort
+#[inline]
+pub fn convert_datetime_to_f64(dt: &DateTime) -> Result<f64> {
+    let val = convert_datetime_to_numeric_string(dt).parse()?;
+    Ok(val)
+}
+
+/// Converts a `Duration` to float64 in best effort
+#[inline]
+pub fn convert_duration_to_f64(dur: Duration) -> Result<f64> {
+    let val = convert_duration_to_numeric_string(dur).parse()?;
+    Ok(val)
+}
+
+/// Converts a `Decimal` to float64 in best effort
+#[inline]
+pub fn convert_decimal_to_f64(dec: &Decimal) -> Result<f64> {
+    let val = dec.to_string().parse()?;
+    Ok(val)
+}
+
+/// Converts a `Json` to float64 in best effort
+#[inline]
+pub fn convert_json_to_f64(ctx: &mut EvalContext, doc: &Json) -> Result<f64> {
+    doc.cast_to_real(ctx)
 }
 
 fn get_valid_int_prefix<'a>(ctx: &mut EvalContext, s: &'a str) -> Result<Cow<'a, str>> {
@@ -603,7 +618,7 @@ fn get_valid_float_prefix<'a>(ctx: &mut EvalContext, s: &'a str) -> Result<&'a s
             valid_len = i + 1;
         }
     }
-    ctx.handle_truncate(valid_len < s.len())?;
+    ctx.handle_truncate(valid_len == 0 || valid_len < s.len())?;
     if valid_len == 0 {
         Ok("0")
     } else {
@@ -1521,24 +1536,160 @@ mod tests {
     }
 
     #[test]
-    fn test_bytes_to_f64() {
-        let tests: Vec<(&'static [u8], f64)> = vec![
-            (b"", 0.0),
-            (b" 23", 23.0),
-            (b"-1", -1.0),
-            (b"1.11", 1.11),
-            (b"1.11.00", 0.0),
-            (b"xx", 0.0),
-            (b"0x00", 0.0),
-            (b"11.xx", 0.0),
-            (b"xx.11", 0.0),
+    fn test_convert_bytes_to_f64() {
+        let tests: Vec<(&'static [u8], Option<f64>)> = vec![
+            (b"", None),
+            (b" 23", Some(23.0)),
+            (b"-1", Some(-1.0)),
+            (b"1.11", Some(1.11)),
+            (b"1.11.00", None),
+            (b"xx", None),
+            (b"0x00", None),
+            (b"11.xx", None),
+            (b"xx.11", None),
         ];
 
-        for (v, f) in tests {
-            let ff = super::bytes_to_f64_without_context(v).unwrap();
-            if (ff - f).abs() > EPSILON {
-                panic!("{:?} should be decode to {}, but got {}", v, f, ff);
+        let mut ctx = EvalContext::default();
+        for (i, (v, expect)) in tests.iter().enumerate() {
+            let ff = convert_bytes_to_f64(&mut ctx, v);
+            match expect {
+                Some(val) => {
+                    let got = ff.unwrap();
+                    if (got - val).abs() > EPSILON {
+                        panic!(
+                            "{:?} should be decode to {:?}, but got {:?}",
+                            v, expect, got
+                        );
+                    }
+                }
+                None => {
+                    assert!(
+                        ff.is_err(),
+                        "index: {}, {:?} should not be converted, but got: {:?}",
+                        i,
+                        v,
+                        ff
+                    );
+                }
             }
+        }
+
+        // test overflow
+        let mut ctx = EvalContext::default();
+        let val = convert_bytes_to_f64(&mut ctx, f64::INFINITY.to_string().as_bytes());
+        assert!(val.is_err());
+
+        let mut ctx = EvalContext::default();
+        let val = convert_bytes_to_f64(&mut ctx, f64::NEG_INFINITY.to_string().as_bytes());
+        assert!(val.is_err());
+
+        // OVERFLOW_AS_WARNING
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::OVERFLOW_AS_WARNING)));
+        let val = convert_bytes_to_f64(
+            &mut ctx,
+            (0..309).map(|_| '9').collect::<String>().as_bytes(),
+        )
+        .unwrap();
+        assert!((val - f64::MAX).abs() < EPSILON);
+        assert_eq!(ctx.warnings.warning_cnt, 1);
+        assert_eq!(ctx.warnings.warnings[0].get_code(), ERR_DATA_OUT_OF_RANGE);
+
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::OVERFLOW_AS_WARNING)));
+        let val = convert_bytes_to_f64(
+            &mut ctx,
+            (0..310)
+                .map(|i| if i == 0 { '-' } else { '9' })
+                .collect::<String>()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!((val - f64::MIN).abs() < EPSILON);
+        assert_eq!(ctx.warnings.warning_cnt, 1);
+        assert_eq!(ctx.warnings.warnings[0].get_code(), ERR_DATA_OUT_OF_RANGE);
+
+        // TRUNCATE_AS_WARNING
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING)));
+        let val = convert_bytes_to_f64(&mut ctx, b"");
+        assert!(val.is_ok());
+        assert!((val.unwrap() - 0.0).abs() < EPSILON);
+        assert_eq!(ctx.warnings.warnings.len(), 1);
+
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING)));
+        let val = convert_bytes_to_f64(&mut ctx, b"1.1a");
+        assert!(val.is_ok());
+        assert!((val.unwrap() - 1.1).abs() < EPSILON);
+        assert_eq!(ctx.warnings.warnings.len(), 1);
+
+        // IGNORE_TRUNCATE
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::IGNORE_TRUNCATE)));
+        let val = convert_bytes_to_f64(&mut ctx, b"1.2a");
+        assert!(val.is_ok());
+        assert!((val.unwrap() - 1.2).abs() < EPSILON);
+        assert_eq!(ctx.warnings.warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_convert_datetime_to_f64() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, 20121231113045.1235f64),
+            ("2012-12-31 11:30:45.123456", 6, 20121231113045.123456f64),
+            ("2012-12-31 11:30:45.123456", 0, 20121231113045f64),
+            ("2012-12-31 11:30:45.999999", 0, 20121231113046f64),
+            ("2017-01-05 08:40:59.575601", 0, 20170105084100f64),
+            ("2017-01-05 23:59:59.575601", 0, 20170106000000f64),
+            ("0000-00-00 00:00:00", 6, 0f64),
+        ];
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let get = convert_datetime_to_f64(&t).unwrap();
+            assert_eq!(
+                (expect - get).abs() < EPSILON,
+                "expect: {}, got: {}",
+                expect,
+                get
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_duration_to_f64() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, 113045.1235f64),
+            ("2012-12-31 11:30:45.123456", 6, 113045.123456f64),
+            ("2012-12-31 11:30:45.123456", 0, 113045f64),
+            ("2012-12-31 11:30:45.999999", 0, 113046f64),
+            ("2017-01-05 08:40:59.575601", 0, 084100f64),
+            ("2017-01-05 23:59:59.575601", 0, 0f64),
+            ("0000-00-00 00:00:00", 6, 0f64),
+        ];
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let du = t.to_duration().unwrap();
+            let get = convert_duration_to_f64(du).unwrap();
+            assert_eq!(
+                (expect - get).abs() < EPSILON,
+                "expect: {}, got: {}",
+                expect,
+                get
+            );
+        }
+    }
+
+    fn test_convert_decimal_to_f64() {
+        let cases: Vec<(Decimal, f64)> = vec![
+            (Decimal::from_f64(123456.1).unwrap(), 123456.1f64),
+            (Decimal::from_f64(-123456.1).unwrap(), -123456.1f64),
+            (Decimal::from(123456), 123456f64),
+            (Decimal::from(-123456), -123456f64),
+        ];
+        for (dec, expect) in cases {
+            let get = convert_decimal_to_f64(dec).unwrap();
+            assert_eq!(
+                (expect - get).abs() < EPSILON,
+                "expect: {}, got: {}",
+                expect,
+                get
+            );
         }
     }
 

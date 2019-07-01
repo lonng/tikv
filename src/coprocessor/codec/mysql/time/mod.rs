@@ -16,7 +16,6 @@ use cop_datatype::FieldTypeTp;
 use tikv_util::codec::number::{self, NumberEncoder};
 use tikv_util::codec::BytesSlice;
 
-use crate::coprocessor::codec::convert::convert_datetime_to_numeric_string;
 use crate::coprocessor::codec::mysql::duration::{
     Duration as MyDuration, NANOS_PER_SEC, NANO_WIDTH,
 };
@@ -261,15 +260,6 @@ impl Time {
 
     pub fn set_time(&mut self, time: DateTime<Tz>) {
         self.time = time
-    }
-
-    /// TODO: remove this method after implementing `convert_datetime_to_f64`
-    pub fn to_f64(&self) -> Result<f64> {
-        if self.is_zero() {
-            return Ok(0f64);
-        }
-        let f: f64 = box_try!(convert_datetime_to_numeric_string(&self).parse());
-        Ok(f)
     }
 
     fn parse_datetime_format(s: &str) -> Vec<&str> {

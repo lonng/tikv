@@ -15,6 +15,7 @@ use tikv_util::codec::number::{self, NumberEncoder};
 use tikv_util::codec::BytesSlice;
 use tikv_util::escape;
 
+use crate::coprocessor::codec::convert::convert_decimal_to_f64;
 use crate::coprocessor::codec::{convert, Error, Result, TEN_POW};
 use crate::coprocessor::dag::expr::EvalContext;
 
@@ -1511,16 +1512,6 @@ impl Decimal {
         s.parse()
     }
 
-    /// Convert the decimal to float value.
-    ///
-    /// Please note that this conversion may lose precision.
-    pub fn as_f64(&self) -> Result<f64> {
-        let s = format!("{}", self);
-        // Can this line really return error?
-        let f = box_try!(s.parse::<f64>());
-        Ok(f)
-    }
-
     pub fn from_bytes(s: &[u8]) -> Result<Res<Decimal>> {
         Decimal::from_bytes_with_word_buf(s, WORD_BUF_LEN)
     }
@@ -1792,8 +1783,7 @@ impl Display for Decimal {
 impl crate::coprocessor::codec::data_type::AsMySQLBool for Decimal {
     #[inline]
     fn as_mysql_bool(&self, _context: &mut EvalContext) -> crate::coprocessor::Result<bool> {
-        // Note: as_f64() may be never fail?
-        Ok(self.as_f64()?.round() != 0f64)
+        Ok(convert_decimal_to_f64(&self)?.round() != 0f64)
     }
 }
 
