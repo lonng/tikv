@@ -8,9 +8,7 @@ use cop_datatype::prelude::*;
 use cop_datatype::{self, FieldTypeFlag, FieldTypeTp};
 
 use super::{Error, EvalContext, Result, ScalarFunc};
-use crate::coprocessor::codec::convert::{
-    self, convert_bytes_to_int, convert_bytes_to_uint, convert_float_to_int, convert_float_to_uint,
-};
+use crate::coprocessor::codec::convert::*;
 use crate::coprocessor::codec::mysql::decimal::RoundMode;
 use crate::coprocessor::codec::mysql::{charset, Decimal, Duration, Json, Res, Time, TimeType};
 use crate::coprocessor::codec::{mysql, Datum};
@@ -167,14 +165,13 @@ impl ScalarFunc {
             return self.children[0].eval_real(ctx, row);
         }
         let val = try_opt!(self.children[0].eval_string(ctx, row));
-        let res = convert::bytes_to_f64(ctx, &val)?;
+        let res = convert_bytes_to_f64(ctx, &val)?;
         Ok(Some(self.produce_float_with_specified_tp(ctx, res)?))
     }
 
     pub fn cast_time_as_real(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<f64>> {
         let val = try_opt!(self.children[0].eval_time(ctx, row));
-        let val = val.to_decimal()?;
-        let res = val.as_f64()?;
+        let res = val.to_f64()?;
         Ok(Some(self.produce_float_with_specified_tp(ctx, res)?))
     }
 
