@@ -14,6 +14,7 @@ use tikv_util::codec::bytes::{self, BytesEncoder};
 use tikv_util::codec::{number, BytesSlice};
 use tikv_util::escape;
 
+use super::convert::{convert_datetime_to_decimal, convert_duration_to_decimal};
 use super::mysql::{
     self, parse_json_path_expr, Decimal, DecimalEncoder, Duration, Json, JsonEncoder,
     PathExpression, RoundMode, Time, DEFAULT_FSP, MAX_FSP,
@@ -330,11 +331,13 @@ impl Datum {
             Datum::F64(f) => Ok(f),
             Datum::Bytes(bs) => convert::bytes_to_f64(ctx, &bs),
             Datum::Time(t) => {
-                let d = t.to_decimal()?;
+                // TODO: replace with `convert_datetime_to_f64` after implementing
+                let d = convert_datetime_to_decimal(&t)?;
                 d.as_f64()
             }
             Datum::Dur(d) => {
-                let d = Decimal::try_from(d)?;
+                // TODO: replace with `convert_duration_to_f64` after implementing
+                let d = convert_duration_to_decimal(d)?;
                 d.as_f64()
             }
             Datum::Dec(d) => d.as_f64(),
@@ -354,7 +357,7 @@ impl Datum {
             Datum::Bytes(bs) => convert::convert_bytes_to_int(ctx, &bs, FieldTypeTp::LongLong),
             Datum::Time(mut t) => {
                 t.round_frac(mysql::DEFAULT_FSP)?;
-                let d = t.to_decimal()?;
+                let d = convert_datetime_to_decimal(&t)?;
                 d.as_i64().into()
             }
             Datum::Dur(d) => {
@@ -409,7 +412,7 @@ impl Datum {
             Datum::Bytes(bs) => convert::bytes_to_f64(ctx, &bs).map(From::from),
             Datum::Time(t) => {
                 // if time has no precision, return int64
-                let dec = t.to_decimal()?;
+                let dec = convert_datetime_to_decimal(&t)?;
                 if t.get_fsp() == 0 {
                     return Ok(Datum::I64(dec.as_i64().unwrap()));
                 }
@@ -429,7 +432,7 @@ impl Datum {
     /// Keep compatible with TiDB's `ToDecimal` function.
     pub fn into_dec(self) -> Result<Decimal> {
         match self {
-            Datum::Time(t) => t.to_decimal().map_err(From::from),
+            Datum::Time(t) => convert_datetime_to_decimal(&t),
             Datum::Dur(d) => Decimal::try_from(d).map_err(From::from),
             d => match d.coerce_to_dec()? {
                 Datum::Dec(d) => Ok(d),

@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::convert::AsRef;
-use std::convert::TryFrom;
 use std::{self, char, i16, i32, i64, i8, str, u16, u32, u64, u8};
 
 use chrono::Timelike;
@@ -199,7 +198,8 @@ pub fn convert_datetime_to_int(
     // TODO: avoid this clone after refactor the `Time`
     let mut t = dt.clone();
     t.round_frac(DEFAULT_FSP)?;
-    let val = t.to_decimal()?.as_i64_with_ctx(ctx)?;
+    let dec = convert_datetime_to_decimal(dt)?;
+    let val = dec.as_i64_with_ctx(ctx)?;
     convert_int_to_int(ctx, val, tp)
 }
 
@@ -211,7 +211,8 @@ pub fn convert_duration_to_int(
     tp: FieldTypeTp,
 ) -> Result<i64> {
     let dur = dur.round_frac(DEFAULT_FSP)?;
-    let val = Decimal::try_from(dur)?.as_i64_with_ctx(ctx)?;
+    let dec = convert_duration_to_decimal(dur)?;
+    let val = dec.as_i64_with_ctx(ctx)?;
     convert_int_to_int(ctx, val, tp)
 }
 
@@ -337,7 +338,7 @@ pub fn convert_datetime_to_uint(
     // TODO: avoid this clone after refactor the `Time`
     let mut t = dt.clone();
     t.round_frac(DEFAULT_FSP)?;
-    decimal_as_u64!(t.to_decimal()?, ctx, tp)
+    decimal_as_u64!(convert_datetime_to_decimal(&dt)?, ctx, tp)
 }
 
 /// Converts a `Duration` to an u64 value
@@ -348,7 +349,7 @@ pub fn convert_duration_to_uint(
     tp: FieldTypeTp,
 ) -> Result<u64> {
     let dur = dur.round_frac(DEFAULT_FSP)?;
-    decimal_as_u64!(Decimal::try_from(dur)?, ctx, tp)
+    decimal_as_u64!(convert_duration_to_decimal(dur)?, ctx, tp)
 }
 
 /// Converts a `Decimal` to an u64 value
@@ -427,6 +428,45 @@ pub fn convert_duration_to_numeric_string(dur: Duration) -> String {
         buf.push_str(&format!(".{:01$}", nanos, fsp as usize));
     }
     buf
+}
+
+/// Converts a bytes slice to a `Decimal`
+#[inline]
+pub fn convert_bytes_to_decimal(ctx: &mut EvalContext, bytes: &[u8]) -> Result<Decimal> {
+    let dec = match Decimal::from_bytes(bytes)? {
+        Res::Ok(d) => d,
+        Res::Overflow(d) => {
+            ctx.handle_overflow(Error::overflow("DECIMAL", ""))?;
+            d
+        }
+        Res::Truncated(d) => {
+            ctx.handle_truncate(true)?;
+            d
+        }
+    };
+    Ok(dec)
+}
+
+/// Converts a `DateTime` to a `Decimal`
+#[inline]
+pub fn convert_datetime_to_decimal(dt: &DateTime) -> Result<Decimal> {
+    if dt.is_zero() {
+        return Ok(0.into());
+    }
+    convert_datetime_to_numeric_string(dt).parse()
+}
+
+/// Converts a `Duration` to a `Decimal`
+#[inline]
+pub fn convert_duration_to_decimal(dur: Duration) -> Result<Decimal> {
+    convert_duration_to_numeric_string(dur).parse()
+}
+
+/// Converts a `Json` to a `Decimal`
+#[inline]
+pub fn convert_json_to_decimal(ctx: &mut EvalContext, doc: &Json) -> Result<Decimal> {
+    let f = doc.cast_to_real(ctx)?;
+    Decimal::from_f64(f)
 }
 
 /// `bytes_to_int_without_context` converts a byte arrays to an i64
@@ -725,6 +765,7 @@ mod tests {
     use std::{f64, i64, isize, u64};
 
     use crate::coprocessor::codec::error::{ERR_DATA_OUT_OF_RANGE, WARN_DATA_TRUNCATED};
+    use crate::coprocessor::codec::mysql::decimal::{self, DIGITS_PER_WORD, WORD_BUF_LEN};
     use crate::coprocessor::dag::expr::Flag;
     use crate::coprocessor::dag::expr::{EvalConfig, EvalContext};
 
@@ -1388,6 +1429,94 @@ mod tests {
             let du = t.to_duration().unwrap();
             let get = convert_duration_to_numeric_string(du);
             assert_eq!(get, expect);
+        }
+    }
+
+    #[test]
+    fn test_convert_bytes_to_decimal() {
+        let cases: Vec<(&[u8], Decimal)> = vec![
+            (b"123456.1", Decimal::from_f64(123456.1).unwrap()),
+            (b"-123456.1", Decimal::from_f64(-123456.1).unwrap()),
+            (b"123456", Decimal::from(123456)),
+            (b"-123456", Decimal::from(-123456)),
+        ];
+        let mut ctx = EvalContext::default();
+        for (s, expect) in cases {
+            let got = convert_bytes_to_decimal(&mut ctx, s).unwrap();
+            assert_eq!(got, expect, "from {:?}, expect: {} got: {}", s, expect, got);
+        }
+
+        // OVERFLOWING
+        let big = (0..85).map(|_| '9').collect::<String>();
+        let val = convert_bytes_to_decimal(&mut ctx, big.as_bytes());
+        assert!(
+            val.is_err(),
+            "expected error, but got {:?}",
+            val.unwrap().to_string()
+        );
+        assert_eq!(val.unwrap_err().code(), ERR_DATA_OUT_OF_RANGE);
+
+        // OVERFLOW_AS_WARNING
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::OVERFLOW_AS_WARNING)));
+        let val = convert_bytes_to_decimal(&mut ctx, big.as_bytes()).unwrap();
+        let max = decimal::max_decimal(WORD_BUF_LEN * DIGITS_PER_WORD, 0);
+        assert_eq!(
+            val,
+            max,
+            "expect: {}, got: {}",
+            val.to_string(),
+            max.to_string()
+        );
+        assert_eq!(ctx.warnings.warning_cnt, 1);
+        assert_eq!(ctx.warnings.warnings[0].get_code(), ERR_DATA_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn test_convert_datetime_to_decimal() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, "20121231113045.1235"),
+            ("2012-12-31 11:30:45.123456", 6, "20121231113045.123456"),
+            ("2012-12-31 11:30:45.123456", 0, "20121231113045"),
+            ("2012-12-31 11:30:45.999999", 0, "20121231113046"),
+            ("2017-01-05 08:40:59.575601", 0, "20170105084100"),
+            ("2017-01-05 23:59:59.575601", 0, "20170106000000"),
+            ("0000-00-00 00:00:00", 6, "0"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let get = convert_datetime_to_decimal(&t).unwrap();
+            assert_eq!(
+                get,
+                convert_bytes_to_decimal(&mut ctx, expect.as_bytes()).unwrap(),
+                "convert datetime {} to decimal",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_duration_to_decimal() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, "113045.1235"),
+            ("2012-12-31 11:30:45.123456", 6, "113045.123456"),
+            ("2012-12-31 11:30:45.123456", 0, "113045"),
+            ("2012-12-31 11:30:45.999999", 0, "113046"),
+            ("2017-01-05 08:40:59.575601", 0, "084100"),
+            ("2017-01-05 23:59:59.575601", 0, "000000"),
+            ("0000-00-00 00:00:00", 6, "000000"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let du = t.to_duration().unwrap();
+            let get = convert_duration_to_decimal(du).unwrap();
+            assert_eq!(
+                get,
+                convert_bytes_to_decimal(&mut ctx, expect.as_bytes()).unwrap(),
+                "convert duration {} to decimal",
+                s
+            );
         }
     }
 

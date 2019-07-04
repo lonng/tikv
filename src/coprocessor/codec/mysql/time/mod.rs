@@ -20,8 +20,7 @@ use crate::coprocessor::codec::convert::convert_datetime_to_numeric_string;
 use crate::coprocessor::codec::mysql::duration::{
     Duration as MyDuration, NANOS_PER_SEC, NANO_WIDTH,
 };
-use crate::coprocessor::codec::mysql::{self, Decimal};
-use crate::coprocessor::codec::{Error, Result, TEN_POW};
+use crate::coprocessor::codec::{mysql, Error, Result, TEN_POW};
 
 pub use self::extension::*;
 pub use self::tz::Tz;
@@ -262,16 +261,6 @@ impl Time {
 
     pub fn set_time(&mut self, time: DateTime<Tz>) {
         self.time = time
-    }
-
-    /// Returns the `Decimal` representation of the `DateTime/Date`
-    /// TODO: remove this method after implementing `convert_datetime_to_decimal`
-    pub fn to_decimal(&self) -> Result<Decimal> {
-        if self.is_zero() {
-            return Ok(0.into());
-        }
-
-        convert_datetime_to_numeric_string(&self).parse()
     }
 
     /// TODO: remove this method after implementing `convert_datetime_to_f64`
@@ -944,6 +933,7 @@ mod tests {
 
     use chrono::{Duration, Local};
 
+    use crate::coprocessor::codec::convert::convert_datetime_to_decimal;
     use crate::coprocessor::codec::mysql::{Duration as MyDuration, MAX_FSP, UNSPECIFIED_FSP};
 
     fn for_each_tz<F: FnMut(Tz, i64)>(mut f: F) {
@@ -1283,12 +1273,12 @@ mod tests {
         for (t_str, fsp, datetime_dec, date_dec) in cases {
             for_each_tz(move |tz, _offset| {
                 let mut t = Time::parse_datetime(t_str, fsp, &tz).unwrap();
-                let mut res = format!("{}", t.to_decimal().unwrap());
+                let mut res = format!("{}", convert_datetime_to_decimal(&t).unwrap());
                 assert_eq!(res, datetime_dec);
 
                 t = Time::parse_datetime(t_str, 0, &tz).unwrap();
                 t.set_time_type(TimeType::Date).unwrap();
-                res = format!("{}", t.to_decimal().unwrap());
+                res = format!("{}", convert_datetime_to_decimal(&t).unwrap());
                 assert_eq!(res, date_dec);
             });
         }

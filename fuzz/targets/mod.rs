@@ -162,7 +162,6 @@ fn fuzz_time(
     let _ = t.clone().set_time_type(cursor.read_as_time_type()?);
     let _ = t.is_zero();
     let _ = t.invalid_zero();
-    let _ = t.to_decimal();
     let _ = t.to_f64();
     let _ = t.to_duration();
     let _ = t.to_packed_u64();

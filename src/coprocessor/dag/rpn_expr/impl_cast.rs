@@ -6,6 +6,7 @@ use cop_codegen::rpn_fn;
 use cop_datatype::{EvalType, FieldTypeAccessor, FieldTypeFlag};
 use tipb::expression::FieldType;
 
+use crate::coprocessor::codec::convert::convert_datetime_to_decimal;
 use crate::coprocessor::codec::data_type::*;
 use crate::coprocessor::dag::expr::EvalContext;
 use crate::coprocessor::dag::rpn_expr::{RpnExpressionNode, RpnFnCallExtra};
@@ -133,7 +134,7 @@ pub fn cast_time_as_real(val: &Option<DateTime>) -> Result<Option<Real>> {
     match val {
         None => Ok(None),
         Some(val) => {
-            let val = val.to_decimal()?.as_f64()?;
+            let val = convert_datetime_to_decimal(&val)?.as_f64()?;
             Ok(Real::new(val).ok())
         }
     }
