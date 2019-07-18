@@ -679,10 +679,11 @@ impl Duration {
     }
 }
 
+// TODO: define a convert::Convert trait for all conversion
 impl TryFrom<Duration> for Decimal {
     type Error = crate::coprocessor::codec::Error;
     fn try_from(duration: Duration) -> Result<Decimal> {
-        duration.format("").parse()
+        duration.to_numeric_string().parse()
     }
 }
 
@@ -1153,4 +1154,30 @@ mod benches {
             assert_eq!(get, expect.to_string());
         }
     }
+
+    #[test]
+    fn test_to_decimal() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, "113045.1235"),
+            ("2012-12-31 11:30:45.123456", 6, "113045.123456"),
+            ("2012-12-31 11:30:45.123456", 0, "113045"),
+            ("2012-12-31 11:30:45.999999", 0, "113046"),
+            ("2017-01-05 08:40:59.575601", 0, "084100"),
+            ("2017-01-05 23:59:59.575601", 0, "000000"),
+            ("0000-00-00 00:00:00", 6, "000000"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let du = t.to_duration().unwrap();
+            let get = Decimal::try_from(du).unwrap();
+            assert_eq!(
+                get,
+                convert_bytes_to_decimal(&mut ctx, expect.as_bytes()).unwrap(),
+                "convert duration {} to decimal",
+                s
+            );
+        }
+    }
+
 }

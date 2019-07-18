@@ -303,6 +303,7 @@ impl Time {
     }
 
     /// Returns the `Decimal` representation of the `DateTime/Date`
+    #[inline]
     pub fn to_decimal(&self) -> Result<Decimal> {
         if self.is_zero() {
             return Ok(0.into());
@@ -973,9 +974,8 @@ mod tests {
 
     use std::cmp::Ordering;
 
-    use chrono::{Duration, Local};
-
     use crate::coprocessor::codec::mysql::{Duration as MyDuration, MAX_FSP, UNSPECIFIED_FSP};
+    use chrono::{Duration, Local};
 
     fn for_each_tz<F: FnMut(Tz, i64)>(mut f: F) {
         const MIN_OFFSET: i64 = -60 * 24 + 1;
@@ -1287,6 +1287,30 @@ mod tests {
             let t = Time::parse_utc_datetime(s, fsp).unwrap();
             let get = t.to_numeric_string();
             assert_eq!(get, expect);
+        }
+    }
+
+    #[test]
+    fn test_to_decimal() {
+        let cases = vec![
+            ("2012-12-31 11:30:45.123456", 4, "20121231113045.1235"),
+            ("2012-12-31 11:30:45.123456", 6, "20121231113045.123456"),
+            ("2012-12-31 11:30:45.123456", 0, "20121231113045"),
+            ("2012-12-31 11:30:45.999999", 0, "20121231113046"),
+            ("2017-01-05 08:40:59.575601", 0, "20170105084100"),
+            ("2017-01-05 23:59:59.575601", 0, "20170106000000"),
+            ("0000-00-00 00:00:00", 6, "0"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (s, fsp, expect) in cases {
+            let t = DateTime::parse_utc_datetime(s, fsp).unwrap();
+            let get = t.to_decimal().unwrap();
+            assert_eq!(
+                get,
+                convert_bytes_to_decimal(&mut ctx, expect.as_bytes()).unwrap(),
+                "convert datetime {} to decimal",
+                s
+            );
         }
     }
 
