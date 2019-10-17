@@ -16,6 +16,7 @@ use std::str::FromStr;
 
 use super::Result;
 use crate::config::TiKvConfig;
+use profiler;
 use tikv_alloc::error::ProfError;
 use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
@@ -144,9 +145,11 @@ impl StatusServer {
         }))
     }
 
-    pub fn dump_prof_to_resp(
+    pub fn dump_prof_to_resp<F>(
+        func: F,
         req: Request<Body>,
-    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>
+     where  F: Fn(u64) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send>  {
         let query = match req.uri().query() {
             Some(query) => query,
             None => {
@@ -173,7 +176,7 @@ impl StatusServer {
         };
 
         Box::new(
-            Self::dump_prof(seconds)
+            func(seconds)
                 .and_then(|buf| {
                     let response = Response::builder()
                         .header("X-Content-Type-Options", "nosniff")
@@ -191,6 +194,51 @@ impl StatusServer {
                         .unwrap();
                     ok(response)
                 }),
+        )
+    }
+
+    pub fn dump_cpu_prof(
+        seconds: u64,
+    ) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
+        let tmp_dir = match TempDir::new() {
+            Ok(tmp_dir) => tmp_dir,
+            Err(e) => return Box::new(err(e.into())),
+        };
+        let path = match tmp_dir.path().join("tikv_cpu_dump_profile").to_str() {
+            Some(path) => path.to_owned(),
+            None => return Box::new(err(ProfError::CPUProfilingStartFailed)),
+        };
+        let succ = profiler::start(&path);
+        if !succ {
+            return Box::new(err(ProfError::CPUProfilingStartFailed));
+        }
+
+        info!("start cpu profiling {} seconds", seconds);
+
+        let timer = GLOBAL_TIMER_HANDLE.clone();
+        Box::new(
+            timer
+                .delay(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
+                .then(
+                    move |_| -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
+                        let succ = profiler::stop();
+                        if !succ {
+                            return Box::new(err(ProfError::CPUProfilingStopFailed));
+                        }
+                        Box::new(
+                            tokio_fs::file::File::open(path)
+                                .and_then(|file| {
+                                    let buf: Vec<u8> = Vec::new();
+                                    tokio_io::io::read_to_end(file, buf)
+                                })
+                                .and_then(move |(_, buf)| {
+                                    drop(tmp_dir);
+                                    ok(buf)
+                                })
+                                .map_err(|e| -> ProfError { e.into() }),
+                        )
+                    },
+                ),
         )
     }
 
@@ -238,7 +286,8 @@ impl StatusServer {
                         match (method, path.as_ref()) {
                             (Method::GET, "/metrics") => Box::new(ok(Response::new(dump().into()))),
                             (Method::GET, "/status") => Box::new(ok(Response::default())),
-                            (Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(req),
+                            (Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(Self::dump_prof, req),
+                            (Method::GET, "/pprof/cpu") => Self::dump_prof_to_resp(Self::dump_cpu_prof, req),
                             (Method::GET, "/config") => Self::config_handler(config.clone()),
                             _ => Box::new(ok(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
