@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_threadpool::{Builder, ThreadPool};
 
+use std::borrow::Borrow;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -21,6 +22,8 @@ use tikv_alloc::error::ProfError;
 use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+
+const MAX_SEARCH_LOG_RESULT_SIZE: usize = 1 << 16;
 
 mod profiler_guard {
     use tikv_alloc::error::ProfResult;
@@ -149,7 +152,9 @@ impl StatusServer {
         func: F,
         req: Request<Body>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>
-     where  F: Fn(u64) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send>  {
+    where
+        F: Fn(u64) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send>,
+    {
         let query = match req.uri().query() {
             Some(query) => query,
             None => {
@@ -258,6 +263,93 @@ impl StatusServer {
         Box::new(ok(res))
     }
 
+    pub fn search_log(
+        config: Arc<TiKvConfig>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        if config.log_file.is_empty() {
+            let res = Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    "TiKV cannot provide log service because of the log output to terminal",
+                ))
+                .unwrap();
+            return Box::new(ok(res));
+        }
+
+        let query = match req.uri().query() {
+            Some(query) => query,
+            None => {
+                let response = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::empty())
+                    .unwrap();
+                return Box::new(ok(response));
+            }
+        };
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let begin_time: i64 = match query_pairs.get("begin_time") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => 0,
+        };
+        let end_time: i64 = match query_pairs.get("end_time") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => std::i64::MAX,
+        };
+        let limit: usize = match query_pairs.get("limit") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => MAX_SEARCH_LOG_RESULT_SIZE,
+        };
+        let level: Option<log::Level> = match query_pairs.get("level") {
+            Some(val) => log::Level::from_str(val),
+            None => None,
+        };
+        let src_file = query_pairs.get("src").map_or("", |s| s.borrow());
+        let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
+
+        let results = log::search(
+            &config.log_file,
+            begin_time,
+            end_time,
+            level,
+            src_file,
+            filter,
+            limit.min(MAX_SEARCH_LOG_RESULT_SIZE),
+        );
+        let res = Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(results.join("\n")))
+            .unwrap();
+        Box::new(ok(res))
+    }
+
     pub fn start(&mut self, status_addr: String) -> Result<()> {
         let addr = SocketAddr::from_str(&status_addr)?;
 
@@ -286,9 +378,14 @@ impl StatusServer {
                         match (method, path.as_ref()) {
                             (Method::GET, "/metrics") => Box::new(ok(Response::new(dump().into()))),
                             (Method::GET, "/status") => Box::new(ok(Response::default())),
-                            (Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(Self::dump_prof, req),
-                            (Method::GET, "/pprof/cpu") => Self::dump_prof_to_resp(Self::dump_cpu_prof, req),
+                            (Method::GET, "/pprof/profile") => {
+                                Self::dump_prof_to_resp(Self::dump_prof, req)
+                            }
+                            (Method::GET, "/pprof/cpu") => {
+                                Self::dump_prof_to_resp(Self::dump_cpu_prof, req)
+                            }
                             (Method::GET, "/config") => Self::config_handler(config.clone()),
+                            (Method::GET, "/log") => Self::search_log(config.clone(), req),
                             _ => Box::new(ok(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
                                 .body(Body::empty())
@@ -394,6 +491,301 @@ fn handle_fail_points_request(
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(Body::empty())
             .unwrap())),
+    }
+}
+
+mod log {
+    use std::convert::From;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::path::Path;
+    use std::time::Instant;
+
+    use chrono::DateTime;
+    use nom::bytes::complete::{tag, take, take_until};
+    use nom::character::complete::{alpha1, space0, space1};
+    use nom::sequence::tuple;
+    use nom::*;
+    use rev_lines;
+    use walkdir::WalkDir;
+
+    const INVALID_TIMESTAMP: i64 = -1;
+    const TIMESTAMP_LENGTH: usize = 30;
+
+    #[derive(Debug, Eq, PartialEq, Clone, Copy)]
+    pub enum Level {
+        /// Critical
+        Critical,
+        /// Error
+        Error,
+        /// Warning
+        Warning,
+        /// Info
+        Info,
+        /// Debug
+        Debug,
+        /// Trace
+        Trace,
+    }
+
+    #[derive(Debug)]
+    pub enum Error {
+        ParseError,
+        IOError(std::io::Error),
+    }
+
+    impl From<std::io::Error> for Error {
+        fn from(err: std::io::Error) -> Self {
+            Error::IOError(err)
+        }
+    }
+
+    impl Level {
+        pub fn from_str(input: &str) -> Option<Level> {
+            match input {
+                "trace" | "TRACE" => Some(Level::Trace),
+                "debug" | "DEBUG" => Some(Level::Debug),
+                "info" | "INFO" => Some(Level::Info),
+                "warn" | "WARN" | "warning" | "WARNING" => Some(Level::Warning),
+                "error" | "ERROR" => Some(Level::Error),
+                "critical" | "CRITICAL" => Some(Level::Critical),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct LogMeta<'a> {
+        pub time: i64,
+        pub level: Option<Level>,
+        pub file: &'a str,
+    }
+
+    fn parse_time(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, time, _)) =
+            tuple((space0, tag("["), take(TIMESTAMP_LENGTH), tag("]")))(input)?;
+        Ok((input, time))
+    }
+
+    fn parse_level(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, level, _)) = tuple((space0, tag("["), alpha1, tag("]")))(input)?;
+        Ok((input, level))
+    }
+
+    fn parse_file(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, level, _)) =
+            tuple((space0, tag("["), take_until("]"), tag("]")))(input)?;
+        Ok((input, level))
+    }
+
+    /// Parses the single log line and retrieve the log meta and log body.
+    fn parse<'a>(input: &'a str) -> IResult<&str, LogMeta<'a>> {
+        let (content, (time, level, file, _)) =
+            tuple((parse_time, parse_level, parse_file, space1))(input)?;
+        Ok((
+            content,
+            LogMeta {
+                time: match DateTime::parse_from_str(time, "%Y/%m/%d %H:%M:%S%.3f %z") {
+                    Ok(t) => t.timestamp_millis(),
+                    Err(_) => -1,
+                },
+                level: Level::from_str(level),
+                file: file,
+            },
+        ))
+    }
+
+    /// Parses the start time and end time of a log file and return the maximal and minimal
+    /// timestamp in unix milliseconds.
+    fn parse_time_range(file: &std::fs::File) -> Result<(i64, i64), Error> {
+        let buffer = BufReader::new(file);
+        let file_start_time = match buffer.lines().nth(0) {
+            Some(Ok(line)) => {
+                let (_, meta) = parse(&line).map_err(|_| Error::ParseError)?;
+                meta.time
+            }
+            Some(Err(err)) => {
+                return Err(err.into());
+            }
+            None => INVALID_TIMESTAMP,
+        };
+
+        let buffer = BufReader::new(file);
+        let mut rev_lines = rev_lines::RevLines::with_capacity(512, buffer)?;
+        let file_end_time = match rev_lines.nth(0) {
+            Some(line) => {
+                let (_, meta) = parse(&line).map_err(|_| Error::ParseError)?;
+                meta.time
+            }
+            None => INVALID_TIMESTAMP,
+        };
+
+        Ok((file_start_time, file_end_time))
+    }
+
+    pub fn search(
+        log_file: &str,
+        start_time: i64,
+        end_time: i64,
+        level: Option<Level>,
+        match_file: &str,
+        text: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        let log_path: &Path = log_file.as_ref();
+        let log_name = match log_path.file_name() {
+            Some(file_name) => match file_name.to_str() {
+                Some(file_name) => file_name,
+                None => {
+                    error!("The log file does not have illegal file name: {}", log_file);
+                    return Vec::new();
+                }
+            },
+            None => {
+                error!("The log file does not have illegal file name: {}", log_file);
+                return Vec::new();
+            }
+        };
+        let log_dir = match log_path.parent() {
+            Some(dir) => dir,
+            None => return Vec::new(),
+        };
+        let start = Instant::now();
+        let mut results = Vec::with_capacity(limit);
+        for entry in WalkDir::new(log_dir) {
+            let entry = entry.unwrap();
+            if !entry.path().is_file() {
+                continue;
+            }
+            let file_name = match entry.file_name().to_str() {
+                Some(file_name) => file_name,
+                None => continue,
+            };
+            // Rorated file name have the same prefix with the original file name
+            if !file_name.starts_with(log_name) {
+                continue;
+            }
+            // Open the file
+            let mut file = match File::open(entry.path()) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+
+            let (file_start_time, file_end_time) = match parse_time_range(&file) {
+                Ok((file_start_time, file_end_time)) => (file_start_time, file_end_time),
+                Err(err) => {
+                    warn!("parse file time range failed"; "file" => file_name, "err" => ?err);
+                    continue;
+                }
+            };
+
+            if (start_time < file_start_time && end_time > file_start_time)
+                || (end_time > file_end_time && start_time < file_end_time)
+            {
+                if let Err(_) = file.seek(SeekFrom::Start(0)) {
+                    continue;
+                }
+                let reader = BufReader::new(&file);
+                for line in reader.lines() {
+                    let input = match line {
+                        Ok(input) => input,
+                        Err(_) => {
+                            break;
+                        }
+                    };
+                    if input.len() < TIMESTAMP_LENGTH {
+                        continue;
+                    }
+                    match parse(&input) {
+                        Ok((content, meta)) => {
+                            // The remain content timestamp more the end time or this file contains inrecognation formation
+                            if meta.time == INVALID_TIMESTAMP && meta.time > end_time {
+                                break;
+                            }
+                            if meta.time < start_time {
+                                continue;
+                            }
+                            if let Some(level) = level {
+                                // Match the log level
+                                let log_level = match meta.level {
+                                    Some(level) => level,
+                                    None => continue,
+                                };
+                                if log_level != level {
+                                    continue;
+                                }
+                            }
+                            // Match the log file
+                            if match_file.len() > 0 && !meta.file.contains(match_file) {
+                                continue;
+                            }
+                            if text.len() > 0 && !content.contains(text) {
+                                continue;
+                            }
+                            results.push(input);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+        info!(
+            "matched count: {}: {:?}",
+            results.len(),
+            Instant::now() - start
+        );
+        results
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_time() {
+            assert_eq!(
+                parse_time("[2019/08/23 18:09:52.387 +08:00]"),
+                Ok(("", "2019/08/23 18:09:52.387 +08:00"))
+            );
+            assert_eq!(
+                parse_time(" [2019/08/23 18:09:52.387 +08:00] ["),
+                Ok((" [", "2019/08/23 18:09:52.387 +08:00"))
+            );
+        }
+
+        #[test]
+        fn test_parse_level() {
+            assert_eq!(parse_level("[INFO]"), Ok(("", "INFO")));
+            assert_eq!(parse_level(" [WARN] ["), Ok((" [", "WARN")));
+        }
+
+        #[test]
+        fn test_parse_file() {
+            assert_eq!(parse_file("[foo.rs:100]"), Ok(("", "foo.rs:100")));
+            assert_eq!(parse_file(" [bar.rs:200] ["), Ok((" [", "bar.rs:200")));
+        }
+
+        #[test]
+        fn test_parse() {
+            let cs: Vec<(&str, &str, &str, Option<Level>)> = vec![
+                ("[2019/08/23 18:09:52.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]", Some(Level::Info)),
+                ("[2019/08/23 18:09:52.387 +08:00]    [INFO] [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("[2019/08/23 18:09:52.387 +08:00]    [INFO]     [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [INFO]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [info]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [warning]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Warning)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [warn]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Warning)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [xxx]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",None),
+            ];
+            for (input, file, content, level) in cs.into_iter() {
+                let r = parse(input);
+                assert!(r.is_ok());
+                let log = r.unwrap();
+                assert_eq!(log.0, content);
+                assert_eq!(log.1.level, level);
+                assert_eq!(log.1.file, file);
+            }
+        }
     }
 }
 
