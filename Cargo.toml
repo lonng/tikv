@@ -111,8 +111,8 @@ mime = "0.3.13"
 farmhash = "1.1.5"
 failure = "0.1"
 tipb = { git = "https://github.com/pingcap/tipb.git" }
-kvproto = { git = "https://github.com/pingcap/kvproto.git" }
-nom = "5.0.1"
+kvproto = { git = "https://github.com/lonng/kvproto.git", branch = "hackthon" }
+nom = "5.0.1" 
 walkdir = "2"
 rev_lines = "0.2.1"
 

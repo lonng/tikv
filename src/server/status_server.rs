@@ -277,16 +277,7 @@ impl StatusServer {
             return Box::new(ok(res));
         }
 
-        let query = match req.uri().query() {
-            Some(query) => query,
-            None => {
-                let response = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Body::empty())
-                    .unwrap();
-                return Box::new(ok(response));
-            }
-        };
+        let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
         let begin_time: i64 = match query_pairs.get("begin_time") {
             Some(val) => match val.parse() {
@@ -334,6 +325,7 @@ impl StatusServer {
         let src_file = query_pairs.get("src").map_or("", |s| s.borrow());
         let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
 
+        info!("Search log"; "begin_time" => begin_time, "end_time" => end_time, "level" => ?level, "src_file" => src_file, "filter" => filter);
         let results = log::search(
             &config.log_file,
             begin_time,

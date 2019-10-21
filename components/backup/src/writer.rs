@@ -93,7 +93,8 @@ impl BackupWriter {
                 let mut limit_reader = LimitReader::new(limiter, &mut contents);
                 storage.write(&name, &mut limit_reader)?;
                 let mut file = File::new();
-                file.set_crc32(checksum);
+                // FIXME: protocol incompitable
+                // file.set_crc32(checksum);
                 file.set_name(name);
                 Ok(file)
             };
