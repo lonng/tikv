@@ -7,6 +7,7 @@ use futures::Stream;
 use futures::{self, Future};
 use hyper::service::service_fn;
 use hyper::{self, header, Body, Method, Request, Response, Server, StatusCode};
+use protobuf::Message;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_threadpool::{Builder, ThreadPool};
@@ -17,7 +18,6 @@ use std::str::FromStr;
 
 use super::Result;
 use crate::config::TiKvConfig;
-use profiler;
 use tikv_alloc::error::ProfError;
 use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
@@ -205,20 +205,13 @@ impl StatusServer {
     pub fn dump_cpu_prof(
         seconds: u64,
     ) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
-        let tmp_dir = match TempDir::new() {
-            Ok(tmp_dir) => tmp_dir,
-            Err(e) => return Box::new(err(e.into())),
+        match rsperftools::PROFILER.lock() {
+            Ok(mut profiler) => match profiler.start(100) {
+                Ok(_) => info!("start cpu profiling {} seconds", seconds),
+                Err(_) => return Box::new(err(ProfError::CPUProfilingStartFailed)),
+            },
+            Err(_) => return Box::new(err(ProfError::CpuProfilingLockFailed)),
         };
-        let path = match tmp_dir.path().join("tikv_cpu_dump_profile").to_str() {
-            Some(path) => path.to_owned(),
-            None => return Box::new(err(ProfError::CPUProfilingStartFailed)),
-        };
-        let succ = profiler::start(&path);
-        if !succ {
-            return Box::new(err(ProfError::CPUProfilingStartFailed));
-        }
-
-        info!("start cpu profiling {} seconds", seconds);
 
         let timer = GLOBAL_TIMER_HANDLE.clone();
         Box::new(
@@ -226,22 +219,32 @@ impl StatusServer {
                 .delay(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
                 .then(
                     move |_| -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
-                        let succ = profiler::stop();
-                        if !succ {
-                            return Box::new(err(ProfError::CPUProfilingStopFailed));
+                        match rsperftools::PROFILER.lock() {
+                            Ok(mut profiler) => {
+                                let result = match profiler.report() {
+                                    Ok(report) => {
+                                        info!("get cpu profile report successfully");
+                                        match report.pprof().map(|profile| profile.write_to_bytes())
+                                        {
+                                            Ok(body) => ok(body.unwrap()),
+                                            Err(e) => {
+                                                warn!("report profiling failed: {:?}", e);
+                                                err(ProfError::CPUProfilingReportFailed)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("report profiling failed: {:?}", e);
+                                        err(ProfError::CPUProfilingReportFailed)
+                                    }
+                                };
+                                if let Err(err) = profiler.stop() {
+                                    warn!("stop profiling failed: {:?}", err);
+                                }
+                                return Box::new(result);
+                            }
+                            Err(_) => return Box::new(err(ProfError::CPUProfilingReportFailed)),
                         }
-                        Box::new(
-                            tokio_fs::file::File::open(path)
-                                .and_then(|file| {
-                                    let buf: Vec<u8> = Vec::new();
-                                    tokio_io::io::read_to_end(file, buf)
-                                })
-                                .and_then(move |(_, buf)| {
-                                    drop(tmp_dir);
-                                    ok(buf)
-                                })
-                                .map_err(|e| -> ProfError { e.into() }),
-                        )
                     },
                 ),
         )
