@@ -2423,15 +2423,18 @@ dependencies = [
 
 [[package]]
 name = "rsperftools"
-version = "0.1.2"
-source = "git+https://github.com/lonng/rsperftools?branch=pprof#25eb8e5bcd0b34ff8bd14796c89a885c5a23cecf"
+version = "0.2.0"
+source = "git+https://github.com/lonng/rsperftools?branch=pprof#754c56546cdbb0c982176b03d992f1512d16f949"
 dependencies = [
  "backtrace",
  "lazy_static",
+ "log",
  "nix 0.15.0",
  "protobuf 2.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "protobuf-build",
  "quick-error",
+ "rustc-demangle",
+ "spin",
 ]
 
 [[package]]

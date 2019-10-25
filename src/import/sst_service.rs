@@ -243,9 +243,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
 
     fn download(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        req: DownloadRequest,
-        sink: ::grpcio::UnarySink<DownloadResponse>,
+        _ctx: ::grpcio::RpcContext,
+        _req: DownloadRequest,
+        _sink: ::grpcio::UnarySink<DownloadResponse>,
     ) {
         unimplemented!()
     }

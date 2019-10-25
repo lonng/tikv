@@ -81,8 +81,6 @@ pub struct StatusServer {
     rx: Option<Receiver<()>>,
     addr: Option<SocketAddr>,
     config: Arc<TiKvConfig>,
-    // log search service
-    log_iters: Mutex<HashMap<String, log::LogIterator>>,
 }
 
 impl StatusServer {
@@ -104,7 +102,6 @@ impl StatusServer {
             rx: Some(rx),
             addr: None,
             config: Arc::new(tikv_config),
-            log_iters: Default::default(),
         }
     }
 
@@ -209,46 +206,33 @@ impl StatusServer {
     pub fn dump_cpu_prof(
         seconds: u64,
     ) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
-        match rsperftools::PROFILER.lock() {
-            Ok(mut profiler) => match profiler.start(100) {
-                Ok(_) => info!("start cpu profiling {} seconds", seconds),
-                Err(_) => return Box::new(err(ProfError::CPUProfilingStartFailed)),
-            },
+        let guard = match rsperftools::ProfilerGuard::new(100) {
+            Ok(guard) => guard,
             Err(_) => return Box::new(err(ProfError::CpuProfilingLockFailed)),
         };
-
         let timer = GLOBAL_TIMER_HANDLE.clone();
         Box::new(
             timer
                 .delay(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
                 .then(
                     move |_| -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
-                        match rsperftools::PROFILER.lock() {
-                            Ok(mut profiler) => {
-                                let result = match profiler.report() {
-                                    Ok(report) => {
-                                        info!("get cpu profile report successfully");
-                                        match report.pprof().map(|profile| profile.write_to_bytes())
-                                        {
-                                            Ok(body) => ok(body.unwrap()),
-                                            Err(e) => {
-                                                warn!("report profiling failed: {:?}", e);
-                                                err(ProfError::CPUProfilingReportFailed)
-                                            }
-                                        }
-                                    }
+                        let result = match guard.report() {
+                            Ok(report) => {
+                                info!("get cpu profile report successfully");
+                                match report.pprof().map(|profile| profile.write_to_bytes()) {
+                                    Ok(body) => ok(body.unwrap()),
                                     Err(e) => {
                                         warn!("report profiling failed: {:?}", e);
                                         err(ProfError::CPUProfilingReportFailed)
                                     }
-                                };
-                                if let Err(err) = profiler.stop() {
-                                    warn!("stop profiling failed: {:?}", err);
                                 }
-                                return Box::new(result);
                             }
-                            Err(_) => return Box::new(err(ProfError::CPUProfilingReportFailed)),
-                        }
+                            Err(e) => {
+                                warn!("report profiling failed: {:?}", e);
+                                err(ProfError::CPUProfilingReportFailed)
+                            }
+                        };
+                        Box::new(result)
                     },
                 ),
         )
@@ -271,7 +255,7 @@ impl StatusServer {
     }
 
     pub fn log_open(
-        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
         config: Arc<TiKvConfig>,
         req: Request<Body>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
@@ -329,7 +313,6 @@ impl StatusServer {
             Ok(iter) => {
                 let name = format!("token-{}", chrono::offset::Utc::now().timestamp_nanos());
                 log_iters.lock().unwrap().insert(name.clone(), iter);
-                info!("Open search log"; "begin_time" => begin_time, "end_time" => end_time, "level" => ?level, "filter" => filter, "token" => &name);
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(name))
@@ -348,8 +331,7 @@ impl StatusServer {
     }
 
     pub fn log_next(
-        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
-        config: Arc<TiKvConfig>,
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
         req: Request<Body>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
         let query = req.uri().query().unwrap_or("");
@@ -368,26 +350,20 @@ impl StatusServer {
             },
             None => MAX_SEARCH_LOG_RESULT_SIZE,
         };
-        info!("Search log next"; "token" => token);
-        {
-            info!("Iteretors"; "token" => token);
-            for (key, _) in log_iters.lock().unwrap().iter() {
-                println!("key {:?}", key);
-            }
-        }
         match log_iters.lock().unwrap().get_mut(token) {
             Some(iter) => {
                 let mut counter = 0;
+                let mut results = vec![];
                 for line in iter {
-                    println!("===> {:?}", line);
+                    results.push(line);
                     counter += 1;
-                    if counter >= MAX_SEARCH_LOG_RESULT_SIZE {
+                    if counter >= limit {
                         break;
                     }
                 }
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("name"))
+                    .body(Body::from(serde_json::to_string(&results).unwrap()))
                     .unwrap();
                 Box::new(ok(res))
             }
@@ -406,15 +382,14 @@ impl StatusServer {
     }
 
     pub fn log_close(
-        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
-        config: Arc<TiKvConfig>,
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
         req: Request<Body>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
         let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
         let token = query_pairs.get("token").map_or("", |s| s.borrow());
         match log_iters.lock().unwrap().remove(token) {
-            Some(iter) => {
+            Some(_) => {
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("sucess"))
@@ -441,11 +416,12 @@ impl StatusServer {
         // TODO: support TLS for the status server.
         let builder = Server::try_bind(&addr)?;
         let config = self.config.clone();
+        let log_iters: Arc<Mutex<HashMap<String, log::LogIterator>>> = Default::default();
 
         // Start to serve.
         let server = builder.serve(move || {
             let config = config.clone();
-            let mut log_iters: Mutex<HashMap<String, log::LogIterator>> = Default::default();
+            let log_iters = Arc::clone(&log_iters);
             // Create a status service.
             service_fn(
                     move |req: Request<Body>| -> Box<
@@ -472,14 +448,10 @@ impl StatusServer {
                             }
                             (Method::GET, "/config") => Self::config_handler(config.clone()),
                             (Method::GET, "/log/open") => {
-                                Self::log_open(&mut log_iters, config.clone(), req)
+                                Self::log_open(&log_iters, config.clone(), req)
                             }
-                            (Method::GET, "/log/next") => {
-                                Self::log_next(&mut log_iters, config.clone(), req)
-                            }
-                            (Method::GET, "/log/close") => {
-                                Self::log_close(&mut log_iters, config.clone(), req)
-                            }
+                            (Method::GET, "/log/next") => Self::log_next(&log_iters, req),
+                            (Method::GET, "/log/close") => Self::log_close(&log_iters, req),
                             _ => Box::new(ok(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
                                 .body(Body::empty())
@@ -695,7 +667,7 @@ mod log {
     }
 
     impl Iterator for LogIterator {
-        type Item = (LogMeta, String);
+        type Item = LogItem;
         fn next(&mut self) -> Option<Self::Item> {
             loop {
                 match &mut self.currrent_lines {
@@ -737,7 +709,11 @@ mod log {
                                     if self.filter.len() > 0 && !content.contains(&self.filter) {
                                         continue;
                                     }
-                                    return Some((meta, String::from(content)));
+                                    return Some(LogItem {
+                                        time: meta.time,
+                                        level: meta.level,
+                                        content: String::from(content),
+                                    });
                                 }
                                 Err(err) => {
                                     warn!("parse line failed: {:?}", err);
@@ -753,7 +729,8 @@ mod log {
         }
     }
 
-    #[derive(Debug, Eq, PartialEq, Clone, Copy)]
+    #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
     pub enum Level {
         /// Critical
         Critical,
@@ -795,10 +772,17 @@ mod log {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct LogMeta {
         pub time: i64,
         pub level: Option<Level>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct LogItem {
+        pub time: i64,
+        pub level: Option<Level>,
+        pub content: String,
     }
 
     fn parse_time(input: &str) -> IResult<&str, &str> {
@@ -812,6 +796,7 @@ mod log {
         Ok((input, level))
     }
 
+    #[allow(dead_code)]
     fn parse_file(input: &str) -> IResult<&str, &str> {
         let (input, (_, _, level, _)) =
             tuple((space0, tag("["), take_until("]"), tag("]")))(input)?;
