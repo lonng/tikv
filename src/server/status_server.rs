@@ -15,6 +15,7 @@ use tokio_threadpool::{Builder, ThreadPool};
 use std::borrow::Borrow;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use super::Result;
 use crate::config::TiKvConfig;
@@ -23,7 +24,7 @@ use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 
-const MAX_SEARCH_LOG_RESULT_SIZE: usize = 1 << 16;
+const MAX_SEARCH_LOG_RESULT_SIZE: usize = 1 << 7;
 
 mod profiler_guard {
     use tikv_alloc::error::ProfResult;
@@ -80,6 +81,8 @@ pub struct StatusServer {
     rx: Option<Receiver<()>>,
     addr: Option<SocketAddr>,
     config: Arc<TiKvConfig>,
+    // log search service
+    log_iters: Mutex<HashMap<String, log::LogIterator>>,
 }
 
 impl StatusServer {
@@ -101,6 +104,7 @@ impl StatusServer {
             rx: Some(rx),
             addr: None,
             config: Arc::new(tikv_config),
+            log_iters: Default::default(),
         }
     }
 
@@ -266,7 +270,8 @@ impl StatusServer {
         Box::new(ok(res))
     }
 
-    pub fn search_log(
+    pub fn log_open(
+        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
         config: Arc<TiKvConfig>,
         req: Request<Body>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
@@ -308,6 +313,48 @@ impl StatusServer {
             },
             None => std::i64::MAX,
         };
+        let level: Option<log::Level> = match query_pairs.get("level") {
+            Some(val) => log::Level::from_str(val),
+            None => None,
+        };
+        let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
+
+        match log::LogIterator::new(
+            &config.log_file,
+            begin_time,
+            end_time,
+            level,
+            filter.to_string(),
+        ) {
+            Ok(iter) => {
+                let name = format!("token-{}", chrono::offset::Utc::now().timestamp_nanos());
+                log_iters.lock().unwrap().insert(name.clone(), iter);
+                info!("Open search log"; "begin_time" => begin_time, "end_time" => end_time, "level" => ?level, "filter" => filter, "token" => &name);
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(name))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            Err(err) => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!("{:?}", err)))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
+    }
+
+    pub fn log_next(
+        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
+        config: Arc<TiKvConfig>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let token = query_pairs.get("token").map_or("", |s| s.borrow());
         let limit: usize = match query_pairs.get("limit") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
@@ -321,28 +368,71 @@ impl StatusServer {
             },
             None => MAX_SEARCH_LOG_RESULT_SIZE,
         };
-        let level: Option<log::Level> = match query_pairs.get("level") {
-            Some(val) => log::Level::from_str(val),
-            None => None,
-        };
-        let src_file = query_pairs.get("src").map_or("", |s| s.borrow());
-        let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
+        info!("Search log next"; "token" => token);
+        {
+            info!("Iteretors"; "token" => token);
+            for (key, _) in log_iters.lock().unwrap().iter() {
+                println!("key {:?}", key);
+            }
+        }
+        match log_iters.lock().unwrap().get_mut(token) {
+            Some(iter) => {
+                let mut counter = 0;
+                for line in iter {
+                    println!("===> {:?}", line);
+                    counter += 1;
+                    if counter >= MAX_SEARCH_LOG_RESULT_SIZE {
+                        break;
+                    }
+                }
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("name"))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            None => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(format!(
+                        "the {:?} dose not open or closed",
+                        token
+                    )))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
+    }
 
-        info!("Search log"; "begin_time" => begin_time, "end_time" => end_time, "level" => ?level, "src_file" => src_file, "filter" => filter);
-        let results = log::search(
-            &config.log_file,
-            begin_time,
-            end_time,
-            level,
-            src_file,
-            filter,
-            limit.min(MAX_SEARCH_LOG_RESULT_SIZE),
-        );
-        let res = Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(results.join("\n")))
-            .unwrap();
-        Box::new(ok(res))
+    pub fn log_close(
+        log_iters: &mut Mutex<HashMap<String, log::LogIterator>>,
+        config: Arc<TiKvConfig>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let token = query_pairs.get("token").map_or("", |s| s.borrow());
+        match log_iters.lock().unwrap().remove(token) {
+            Some(iter) => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("sucess"))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            None => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(format!(
+                        "the {:?} dose not open or closed",
+                        token
+                    )))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
     }
 
     pub fn start(&mut self, status_addr: String) -> Result<()> {
@@ -355,6 +445,7 @@ impl StatusServer {
         // Start to serve.
         let server = builder.serve(move || {
             let config = config.clone();
+            let mut log_iters: Mutex<HashMap<String, log::LogIterator>> = Default::default();
             // Create a status service.
             service_fn(
                     move |req: Request<Body>| -> Box<
@@ -380,7 +471,15 @@ impl StatusServer {
                                 Self::dump_prof_to_resp(Self::dump_cpu_prof, req)
                             }
                             (Method::GET, "/config") => Self::config_handler(config.clone()),
-                            (Method::GET, "/log") => Self::search_log(config.clone(), req),
+                            (Method::GET, "/log/open") => {
+                                Self::log_open(&mut log_iters, config.clone(), req)
+                            }
+                            (Method::GET, "/log/next") => {
+                                Self::log_next(&mut log_iters, config.clone(), req)
+                            }
+                            (Method::GET, "/log/close") => {
+                                Self::log_close(&mut log_iters, config.clone(), req)
+                            }
                             _ => Box::new(ok(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
                                 .body(Body::empty())
@@ -494,7 +593,6 @@ mod log {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     use std::path::Path;
-    use std::time::Instant;
 
     use chrono::DateTime;
     use nom::bytes::complete::{tag, take, take_until};
@@ -506,6 +604,154 @@ mod log {
 
     const INVALID_TIMESTAMP: i64 = -1;
     const TIMESTAMP_LENGTH: usize = 30;
+
+    pub struct LogIterator {
+        search_files: Vec<(i64, File)>,
+        currrent_lines: Option<std::io::Lines<BufReader<File>>>,
+
+        // filter conditions
+        begin_time: i64,
+        end_time: i64,
+        level: Option<Level>,
+        filter: String,
+    }
+
+    #[derive(Debug)]
+    pub struct LogSearchError(String);
+
+    impl From<walkdir::Error> for LogSearchError {
+        fn from(e: walkdir::Error) -> Self {
+            LogSearchError(format!("walk directory: {:?}", e))
+        }
+    }
+
+    impl LogIterator {
+        pub fn new(
+            log_file: &str,
+            begin_time: i64,
+            end_time: i64,
+            level: Option<Level>,
+            filter: String,
+        ) -> Result<Self, LogSearchError> {
+            let log_path: &Path = log_file.as_ref();
+            let log_name = match log_path.file_name() {
+                Some(file_name) => match file_name.to_str() {
+                    Some(file_name) => file_name,
+                    None => return Err(LogSearchError(format!("Invalid utf8: {}", log_file))),
+                },
+                None => return Err(LogSearchError(format!("Illegal file name: {}", log_file))),
+            };
+            let log_dir = match log_path.parent() {
+                Some(dir) => dir,
+                None => return Err(LogSearchError(format!("illegal parent dir: {}", log_file))),
+            };
+
+            let mut search_files = vec![];
+            for entry in WalkDir::new(log_dir) {
+                let entry = entry?;
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let file_name = match entry.file_name().to_str() {
+                    Some(file_name) => file_name,
+                    None => continue,
+                };
+                // Rorated file name have the same prefix with the original file name
+                if !file_name.starts_with(log_name) {
+                    continue;
+                }
+                // Open the file
+                let mut file = match File::open(entry.path()) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+
+                let (file_start_time, file_end_time) = match parse_time_range(&file) {
+                    Ok((file_start_time, file_end_time)) => (file_start_time, file_end_time),
+                    Err(_) => continue,
+                };
+
+                if (begin_time < file_start_time && end_time > file_start_time)
+                    || (end_time > file_end_time && begin_time < file_end_time)
+                {
+                    if let Err(err) = file.seek(SeekFrom::Start(0)) {
+                        warn!("seek file failed: {}, err: {}", file_name, err);
+                        continue;
+                    }
+                    search_files.push((file_start_time, file));
+                }
+            }
+            search_files.sort_by(|a, b| b.0.cmp(&a.0));
+            let current_reader = search_files.pop().map(|file| BufReader::new(file.1));
+            Ok(Self {
+                search_files,
+                currrent_lines: current_reader.map(|reader| reader.lines()),
+                begin_time,
+                end_time,
+                level,
+                filter,
+            })
+        }
+    }
+
+    impl Iterator for LogIterator {
+        type Item = (LogMeta, String);
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                match &mut self.currrent_lines {
+                    Some(lines) => {
+                        loop {
+                            let line = match lines.next() {
+                                Some(line) => line,
+                                None => {
+                                    self.currrent_lines = self
+                                        .search_files
+                                        .pop()
+                                        .map(|file| BufReader::new(file.1))
+                                        .map(|reader| reader.lines());
+                                    break;
+                                }
+                            };
+                            let input = match line {
+                                Ok(input) => input,
+                                Err(err) => {
+                                    warn!("read line failed: {:?}", err);
+                                    continue;
+                                }
+                            };
+                            if input.len() < TIMESTAMP_LENGTH {
+                                continue;
+                            }
+                            match parse(&input) {
+                                Ok((content, meta)) => {
+                                    // The remain content timestamp more the end time or this file contains inrecognation formation
+                                    if meta.time == INVALID_TIMESTAMP && meta.time > self.end_time {
+                                        break;
+                                    }
+                                    if meta.time < self.begin_time {
+                                        continue;
+                                    }
+                                    if self.level.is_some() && meta.level != self.level {
+                                        continue;
+                                    }
+                                    if self.filter.len() > 0 && !content.contains(&self.filter) {
+                                        continue;
+                                    }
+                                    return Some((meta, String::from(content)));
+                                }
+                                Err(err) => {
+                                    warn!("parse line failed: {:?}", err);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            None
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq, Clone, Copy)]
     pub enum Level {
@@ -550,10 +796,9 @@ mod log {
     }
 
     #[derive(Debug)]
-    pub struct LogMeta<'a> {
+    pub struct LogMeta {
         pub time: i64,
         pub level: Option<Level>,
-        pub file: &'a str,
     }
 
     fn parse_time(input: &str) -> IResult<&str, &str> {
@@ -574,9 +819,8 @@ mod log {
     }
 
     /// Parses the single log line and retrieve the log meta and log body.
-    fn parse<'a>(input: &'a str) -> IResult<&str, LogMeta<'a>> {
-        let (content, (time, level, file, _)) =
-            tuple((parse_time, parse_level, parse_file, space1))(input)?;
+    fn parse(input: &str) -> IResult<&str, LogMeta> {
+        let (content, (time, level, _)) = tuple((parse_time, parse_level, space1))(input)?;
         Ok((
             content,
             LogMeta {
@@ -585,7 +829,6 @@ mod log {
                     Err(_) => -1,
                 },
                 level: Level::from_str(level),
-                file: file,
             },
         ))
     }
@@ -616,120 +859,6 @@ mod log {
         };
 
         Ok((file_start_time, file_end_time))
-    }
-
-    pub fn search(
-        log_file: &str,
-        start_time: i64,
-        end_time: i64,
-        level: Option<Level>,
-        match_file: &str,
-        text: &str,
-        limit: usize,
-    ) -> Vec<String> {
-        let log_path: &Path = log_file.as_ref();
-        let log_name = match log_path.file_name() {
-            Some(file_name) => match file_name.to_str() {
-                Some(file_name) => file_name,
-                None => {
-                    error!("The log file does not have illegal file name: {}", log_file);
-                    return Vec::new();
-                }
-            },
-            None => {
-                error!("The log file does not have illegal file name: {}", log_file);
-                return Vec::new();
-            }
-        };
-        let log_dir = match log_path.parent() {
-            Some(dir) => dir,
-            None => return Vec::new(),
-        };
-        let start = Instant::now();
-        let mut results = Vec::with_capacity(limit);
-        for entry in WalkDir::new(log_dir) {
-            let entry = entry.unwrap();
-            if !entry.path().is_file() {
-                continue;
-            }
-            let file_name = match entry.file_name().to_str() {
-                Some(file_name) => file_name,
-                None => continue,
-            };
-            // Rorated file name have the same prefix with the original file name
-            if !file_name.starts_with(log_name) {
-                continue;
-            }
-            // Open the file
-            let mut file = match File::open(entry.path()) {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
-
-            let (file_start_time, file_end_time) = match parse_time_range(&file) {
-                Ok((file_start_time, file_end_time)) => (file_start_time, file_end_time),
-                Err(err) => {
-                    warn!("parse file time range failed"; "file" => file_name, "err" => ?err);
-                    continue;
-                }
-            };
-
-            if (start_time < file_start_time && end_time > file_start_time)
-                || (end_time > file_end_time && start_time < file_end_time)
-            {
-                if let Err(_) = file.seek(SeekFrom::Start(0)) {
-                    continue;
-                }
-                let reader = BufReader::new(&file);
-                for line in reader.lines() {
-                    let input = match line {
-                        Ok(input) => input,
-                        Err(_) => {
-                            break;
-                        }
-                    };
-                    if input.len() < TIMESTAMP_LENGTH {
-                        continue;
-                    }
-                    match parse(&input) {
-                        Ok((content, meta)) => {
-                            // The remain content timestamp more the end time or this file contains inrecognation formation
-                            if meta.time == INVALID_TIMESTAMP && meta.time > end_time {
-                                break;
-                            }
-                            if meta.time < start_time {
-                                continue;
-                            }
-                            if let Some(level) = level {
-                                // Match the log level
-                                let log_level = match meta.level {
-                                    Some(level) => level,
-                                    None => continue,
-                                };
-                                if log_level != level {
-                                    continue;
-                                }
-                            }
-                            // Match the log file
-                            if match_file.len() > 0 && !meta.file.contains(match_file) {
-                                continue;
-                            }
-                            if text.len() > 0 && !content.contains(text) {
-                                continue;
-                            }
-                            results.push(input);
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            }
-        }
-        info!(
-            "matched count: {}: {:?}",
-            results.len(),
-            Instant::now() - start
-        );
-        results
     }
 
     #[cfg(test)]
