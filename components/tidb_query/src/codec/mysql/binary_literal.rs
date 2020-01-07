@@ -11,7 +11,7 @@ use crate::expr::EvalContext;
 
 /// BinaryLiteral is the internal type for storing bit / hex literal type.
 #[derive(Debug)]
-pub struct BinaryLiteral(Vec<u8>);
+pub struct BinaryLiteral(pub Vec<u8>);
 
 fn trim_leading_zero_bytes(bytes: &[u8]) -> &[u8] {
     if bytes.is_empty() {

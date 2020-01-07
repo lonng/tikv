@@ -9,7 +9,9 @@ use tipb::FieldType;
 
 use super::data_type::*;
 use crate::codec::datum;
-use crate::codec::mysql::{DecimalDecoder, DecimalEncoder, JsonDecoder, JsonEncoder};
+use crate::codec::mysql::{
+    binary_literal::BinaryLiteral, DecimalDecoder, DecimalEncoder, JsonDecoder, JsonEncoder,
+};
 use crate::codec::{Error, Result};
 use crate::expr::EvalContext;
 
@@ -358,7 +360,7 @@ pub fn decode_decimal_datum(mut raw_datum: &[u8]) -> Result<Option<Decimal>> {
     }
 }
 
-pub fn decode_bytes_datum(mut raw_datum: &[u8]) -> Result<Option<Bytes>> {
+pub fn decode_bytes_datum(mut raw_datum: &[u8], field_type: &FieldType) -> Result<Option<Bytes>> {
     if raw_datum.is_empty() {
         return Err(Error::InvalidDataType(
             "Failed to decode datum flag".to_owned(),
@@ -372,6 +374,20 @@ pub fn decode_bytes_datum(mut raw_datum: &[u8]) -> Result<Option<Bytes>> {
         datum::BYTES_FLAG => Ok(Some(raw_datum.read_datum_payload_bytes()?)),
         // In record, it's flag is `COMPACT_BYTES`. See TiDB's `encode()`.
         datum::COMPACT_BYTES_FLAG => Ok(Some(raw_datum.read_datum_payload_compact_bytes()?)),
+        // In record, it's flag is `BIT`. See TiDB's `encode()`
+        // https://github.com/pingcap/tidb/blob/0bab73adf5679aad716664251ba0a1708afe1263/types/datum.go#L1259
+        datum::UINT_FLAG => {
+            let v = raw_datum.read_datum_payload_u64()?;
+            let byte_size = (field_type.flen() + 7) >> 3;
+            let v = BinaryLiteral::from_u64(v, byte_size)?;
+            Ok(Some(v.0))
+        }
+        datum::VAR_UINT_FLAG => {
+            let v = raw_datum.read_datum_payload_var_u64()?;
+            let byte_size = (field_type.flen() + 7) >> 3;
+            let v = BinaryLiteral::from_u64(v, byte_size)?;
+            Ok(Some(v.0))
+        }
         _ => Err(Error::InvalidDataType(format!(
             "Unsupported datum flag {} for Bytes vector",
             flag
@@ -486,8 +502,8 @@ impl<'a> RawDatumDecoder<Decimal> for &'a [u8] {
 }
 
 impl<'a> RawDatumDecoder<Bytes> for &'a [u8] {
-    fn decode(self, _field_type: &FieldType, _ctx: &mut EvalContext) -> Result<Option<Bytes>> {
-        decode_bytes_datum(self)
+    fn decode(self, field_type: &FieldType, _ctx: &mut EvalContext) -> Result<Option<Bytes>> {
+        decode_bytes_datum(self, field_type)
     }
 }
 

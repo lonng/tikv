@@ -66,6 +66,7 @@ impl std::convert::TryFrom<crate::FieldTypeTp> for EvalType {
             | crate::FieldTypeTp::MediumBlob
             | crate::FieldTypeTp::LongBlob
             | crate::FieldTypeTp::Blob
+            | crate::FieldTypeTp::Bit
             | crate::FieldTypeTp::VarString
             | crate::FieldTypeTp::String => EvalType::Bytes,
             _ => {
