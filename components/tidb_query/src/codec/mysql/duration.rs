@@ -670,6 +670,8 @@ mod tests {
 
     #[test]
     fn test_parse() {
+        // FIXME: should add some test cases which can be parsed as datetime but
+        // will be refused by duration parser
         let cases: Vec<(&'static [u8], i8, Option<&'static str>)> = vec![
             (b"10:11:12", 0, Some("10:11:12")),
             (b"101112", 0, Some("10:11:12")),
