@@ -362,15 +362,33 @@ impl Duration {
         let fsp = check_fsp(fsp)?;
         parser::parse(input, fsp)
             .or_else(|| {
-                let integer_part = match input.find('.') {
-                    Some(index) => &input[..index],
-                    None => input,
+                // 2006-05-13 03:14:14 => 03:14:14
+                // 20001209020641      => 02:06:41
+                let (day, sub) = match input.find(' ') {
+                    Some(index) => (&input[..index], &input[index..]),
+                    None => ("", input),
                 };
-                if !integer_part.contains(':') {
+                let int_part = match sub.find('.') {
+                    Some(index) => &sub[..index],
+                    None => sub,
+                };
+                if sub.contains(':') {
+                    parser::parse(sub, fsp).and_then(|dur| {
+                        let day: u64 = day.parse().unwrap_or_else(|_| 0);
+                        // FIXME: should use `ctx.handle_overflow()` to handle this case
+                        if day * 24 + dur.hours() as u64 > MAX_HOUR_PART as u64 {
+                            None
+                        } else {
+                            Some(dur)
+                        }
+                    })
+                } else if int_part.len() > 7 {
+                    // sub.len() <= 7 means it should be parsed in duration parser
                     let mut ctx = EvalContext::default();
-                    let dt =
-                        DateTime::parse_datetime(&mut ctx, integer_part, fsp as i8, true).ok()?;
-                    dt.convert(&mut ctx).ok()
+                    DateTime::parse_datetime(&mut ctx, input, fsp as i8, true)
+                        .ok()?
+                        .convert(&mut ctx)
+                        .ok()
                 } else {
                     None
                 }
@@ -680,7 +698,7 @@ mod tests {
             (b"-839:00:00", 0, None),
             (b"23:60:59", 0, None),
             (b"54:59:59", 0, Some("54:59:59")),
-            (b"2011-11-11 00:00:01", 0, None),
+            (b"2011-11-11 00:00:01", 0, Some("00:00:01")),
             (b"2011-11-11", 0, Some("00:00:00")),
             (b"--23", 0, None),
             (b"232 10", 0, None),
@@ -715,6 +733,8 @@ mod tests {
             (b"- 1.1", 1, Some("-00:00:01.1")),
             (b"- 1 .1", 1, Some("-00:00:01.1")),
             (b"18446744073709551615:59:59", 0, None),
+            // FIXME: pass `context` to `Duration::parse`
+            // The result should be Some("838:59:59") if the context contains the `OVERFLOW_AS_WARNING` flag.
             (b"4294967295 0:59:59", 0, None),
             (b"1::2:3", 0, None),
             (b"1.23 3", 0, None),
@@ -722,6 +742,7 @@ mod tests {
             (b"1:02:63", 0, None),
             (b"20010101101010", 0, Some("10:10:10")),
             (b"-231342080", 0, None),
+            (b"2006-05-13 03:14:14", 0, Some("03:14:14")),
         ];
 
         for (input, fsp, expect) in cases {
